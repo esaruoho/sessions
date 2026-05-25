@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+sessions — TUI session picker for Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI.
+
+Usage:
+    sessions [folder]
+
+Run inside (or pass) a project folder. Lists every session any of the three
+agents has for that folder, newest-first. Cursor up/down to select, Enter
+resumes with the right CLI + flags, n starts a new claude session, c starts
+a new copilot, x starts a new codex, q/Esc/Ctrl-C quits. Auto-refreshes
+every ~1.5 s.
+
+Per-provider mapping:
+  • Claude   ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
+             encoded-cwd = realpath, then every non-alphanumeric char → '-'
+             resume: claude --dangerously-skip-permissions --resume <uuid>
+  • Copilot  ~/.copilot/session-store.db  (sessions/turns tables)
+             resume: copilot --resume=<uuid>
+  • Codex    ~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl
+             first line is session_meta with `cwd` and `id`
+             resume: codex resume <uuid>
+
+Apple-native: stdlib only. No Homebrew, no pip.
+"""
+import curses
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import time
+
+
+HOME = os.path.expanduser("~")
+REFRESH_MS = 1500
+
+
+# ─────────────────────────── shared types ────────────────────────────
+
+class Row:
+    __slots__ = ("provider", "uuid", "cwd", "path", "mtime", "size", "turns", "snippet")
+
+    def __init__(self, provider, uuid, cwd, path, mtime, size=0, turns=0, snippet=None):
+        self.provider = provider   # "claude" | "copilot" | "codex"
+        self.uuid = uuid
+        self.cwd = cwd
+        self.path = path           # jsonl path, or sqlite db path for copilot
+        self.mtime = mtime
+        self.size = size
+        self.turns = turns
+        self.snippet = snippet     # lazy; None means not yet loaded
+
+
+# ─────────────────────────── Claude ──────────────────────────────────
+
+def encode_cwd(path):
+    resolved = os.path.realpath(path)
+    out = []
+    for ch in resolved:
+        c = ord(ch)
+        if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122):
+            out.append(ch)
+        else:
+            out.append("-")
+    return "".join(out)
+
+
+def list_claude(folder):
+    proj_dir = f"{HOME}/.claude/projects/{encode_cwd(folder)}"
+    rows = []
+    try:
+        names = os.listdir(proj_dir)
+    except FileNotFoundError:
+        return rows
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        full = os.path.join(proj_dir, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        rows.append(Row("claude", name[:-6], folder, full, st.st_mtime, st.st_size))
+    return rows
+
+
+def load_claude_meta(row):
+    snippet = None
+    summary = None
+    turns = 0
+    try:
+        with open(row.path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("type")
+                if t == "summary" and not summary:
+                    summary = d.get("summary") or d.get("text")
+                if t == "user":
+                    turns += 1
+                    if snippet is None:
+                        m = d.get("message", {})
+                        c = m.get("content", "")
+                        if isinstance(c, list):
+                            parts = []
+                            for x in c:
+                                if isinstance(x, dict) and x.get("type") == "text":
+                                    parts.append(x.get("text", ""))
+                            c = " ".join(parts)
+                        if not isinstance(c, str):
+                            c = str(c)
+                        c = c.strip().replace("\n", " ")
+                        if c and not c.startswith("<"):
+                            snippet = c
+    except FileNotFoundError:
+        pass
+    row.turns = turns
+    row.snippet = (snippet or (("≪ " + summary) if summary else "(empty)"))[:200]
+
+
+# ─────────────────────────── Copilot ─────────────────────────────────
+
+COPILOT_DB = f"{HOME}/.copilot/session-store.db"
+
+
+def list_copilot(folder):
+    if not os.path.isfile(COPILOT_DB):
+        return []
+    resolved = os.path.realpath(folder)
+    rows = []
+    try:
+        con = sqlite3.connect(f"file:{COPILOT_DB}?mode=ro", uri=True, timeout=0.5)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT s.id, s.cwd, COALESCE(s.summary,''), s.updated_at, "
+            "       (SELECT COUNT(*) FROM turns WHERE session_id=s.id) AS n, "
+            "       (SELECT user_message FROM turns WHERE session_id=s.id "
+            "         ORDER BY turn_index ASC LIMIT 1) AS first_msg "
+            "FROM sessions s WHERE s.cwd = ? ORDER BY s.updated_at DESC",
+            (resolved,))
+        for sid, cwd, summary, updated_at, n, first_msg in cur.fetchall():
+            mtime = parse_iso(updated_at)
+            snip = (summary or first_msg or "(empty)").strip().replace("\n", " ")[:200]
+            r = Row("copilot", sid, cwd, COPILOT_DB, mtime, 0, n or 0, snip)
+            rows.append(r)
+        con.close()
+    except sqlite3.Error:
+        return []
+    return rows
+
+
+def load_copilot_meta(row):
+    # Already populated during list_copilot — snippet/turns come from SQL.
+    if row.snippet is None:
+        row.snippet = "(empty)"
+
+
+# ─────────────────────────── Codex ───────────────────────────────────
+
+CODEX_ROOT = f"{HOME}/.codex/sessions"
+
+
+def list_codex(folder):
+    if not os.path.isdir(CODEX_ROOT):
+        return []
+    resolved = os.path.realpath(folder)
+    rows = []
+    # Walk YYYY/MM/DD/rollout-*.jsonl
+    for dirpath, _, filenames in os.walk(CODEX_ROOT):
+        for name in filenames:
+            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            # Parse first line for cwd + id. session_meta is always line 1.
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    first = f.readline()
+                d = json.loads(first)
+                if d.get("type") != "session_meta":
+                    continue
+                p = d.get("payload", {})
+                cwd = p.get("cwd")
+                sid = p.get("id")
+                if not cwd or not sid:
+                    continue
+                if os.path.realpath(cwd) != resolved:
+                    continue
+                # Skip subagent rollouts — those resume the parent thread.
+                source = p.get("source") or {}
+                if "subagent" in source:
+                    continue
+            except Exception:
+                continue
+            rows.append(Row("codex", sid, cwd, full, st.st_mtime, st.st_size))
+    rows.sort(key=lambda r: r.mtime, reverse=True)
+    return rows
+
+
+def load_codex_meta(row):
+    snippet = None
+    turns = 0
+    try:
+        with open(row.path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("type")
+                # User messages on codex live under type=response_item with role=user
+                if t in ("response_item", "user_message"):
+                    p = d.get("payload", {})
+                    role = p.get("role")
+                    if role == "user" or t == "user_message":
+                        turns += 1
+                        if snippet is None:
+                            content = p.get("content") or p.get("text") or ""
+                            if isinstance(content, list):
+                                parts = []
+                                for x in content:
+                                    if isinstance(x, dict):
+                                        parts.append(x.get("text", "") or x.get("content", ""))
+                                content = " ".join(parts)
+                            if not isinstance(content, str):
+                                content = str(content)
+                            content = content.strip().replace("\n", " ")
+                            if content and not content.startswith("<"):
+                                snippet = content
+    except FileNotFoundError:
+        pass
+    row.turns = turns
+    row.snippet = (snippet or "(empty)")[:200]
+
+
+# ─────────────────────────── shared helpers ──────────────────────────
+
+LOAD = {"claude": load_claude_meta, "copilot": load_copilot_meta, "codex": load_codex_meta}
+
+
+def list_all(folder):
+    rows = []
+    rows.extend(list_claude(folder))
+    rows.extend(list_copilot(folder))
+    rows.extend(list_codex(folder))
+    rows.sort(key=lambda r: r.mtime, reverse=True)
+    return rows
+
+
+def parse_iso(s):
+    """Parse SQLite/ISO-8601 timestamp → epoch seconds (local time). 0.0 on fail."""
+    if not s:
+        return 0.0
+    try:
+        from datetime import datetime, timezone
+        # fromisoformat handles 'Z' on 3.11+. Force UTC if no tz; we want local epoch.
+        s2 = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        try:
+            return time.mktime(time.strptime(s[:19], "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            return 0.0
+
+
+def human_age(mtime):
+    """Consistent 4-char width: 12s, 45m, 6h, 11d, 13w, 4mo, 2y."""
+    if mtime <= 0:
+        return " --"
+    diff = time.time() - mtime
+    if diff < 60: return f"{int(diff)}s"
+    if diff < 3600: return f"{int(diff/60)}m"
+    if diff < 86400: return f"{int(diff/3600)}h"
+    if diff < 86400 * 7: return f"{int(diff/86400)}d"
+    if diff < 86400 * 30: return f"{int(diff/86400/7)}w"
+    if diff < 86400 * 365: return f"{int(diff/86400/30)}mo"
+    return f"{int(diff/86400/365)}y"
+
+
+def human_when(mtime):
+    """Calendar timestamp, 11 chars: 'today 14:32' / 'Mon  09:18' / '05-21 14:32' / '2025-11-04'."""
+    if mtime <= 0:
+        return "       --  "
+    lt = time.localtime(mtime)
+    now = time.localtime()
+    if lt.tm_year == now.tm_year and lt.tm_yday == now.tm_yday:
+        return time.strftime("today %H:%M", lt)
+    if lt.tm_year == now.tm_year:
+        return time.strftime("%m-%d %H:%M", lt)
+    return time.strftime("%Y-%m-%d ", lt)
+
+
+def human_size(n):
+    if n < 1024: return f"{n}B"
+    if n < 1024 * 1024: return f"{n/1024:.0f}K"
+    return f"{n/1024/1024:.1f}M"
+
+
+PROVIDER_GLYPH = {"claude": "C", "copilot": "G", "codex": "X"}
+
+
+def find_bin(name, extra_paths=()):
+    candidates = list(extra_paths) + [
+        f"{HOME}/.claude/local/{name}",
+        f"{HOME}/.local/bin/{name}",
+        "/opt/homebrew/bin/" + name,
+        "/usr/local/bin/" + name,
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return shutil.which(name) or name
+
+
+def resume_argv(provider, uuid):
+    if provider == "claude":
+        return [find_bin("claude"), "--dangerously-skip-permissions", "--resume", uuid]
+    if provider == "copilot":
+        return [find_bin("copilot"), f"--resume={uuid}"]
+    if provider == "codex":
+        return [find_bin("codex"), "resume", uuid]
+    raise ValueError(provider)
+
+
+def new_argv(provider):
+    if provider == "claude":
+        return [find_bin("claude"), "--dangerously-skip-permissions"]
+    if provider == "copilot":
+        return [find_bin("copilot")]
+    if provider == "codex":
+        return [find_bin("codex")]
+    raise ValueError(provider)
+
+
+# ─────────────────────────── TUI ─────────────────────────────────────
+
+def run_picker(stdscr, folder):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(REFRESH_MS)
+    try:
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selection
+        curses.init_pair(2, curses.COLOR_CYAN, -1)                  # header
+        curses.init_pair(3, 8, -1)                                  # dim
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)                # claude
+        curses.init_pair(5, curses.COLOR_GREEN, -1)                 # copilot
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)               # codex
+    except Exception:
+        pass
+
+    rows = list_all(folder)
+    sel_key = None  # (provider, uuid) — stable across refresh
+    sel = 0
+    top = 0
+    last_refresh = time.time()
+
+    def ensure_meta(i):
+        r = rows[i]
+        if r.snippet is None:
+            LOAD[r.provider](r)
+
+    def keyfor(r):
+        return (r.provider, r.uuid)
+
+    def re_select():
+        nonlocal sel
+        if sel_key is None:
+            sel = min(sel, max(0, len(rows) - 1))
+            return
+        for i, r in enumerate(rows):
+            if keyfor(r) == sel_key:
+                sel = i
+                return
+        sel = min(sel, max(0, len(rows) - 1))
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+
+        cn = sum(1 for r in rows if r.provider == "claude")
+        gn = sum(1 for r in rows if r.provider == "copilot")
+        xn = sum(1 for r in rows if r.provider == "codex")
+        disp = folder.replace(HOME, "~", 1) if folder.startswith(HOME) else folder
+        header = f" sessions · {disp}   C:{cn} G:{gn} X:{xn}"
+        footer = " ↑/↓ select · ⏎ resume · n new claude · c new copilot · x new codex · q quit · auto-refresh"
+        try:
+            stdscr.addnstr(0, 0, header.ljust(w), w, curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addnstr(h - 1, 0, footer.ljust(w), w - 1, curses.color_pair(3))
+        except curses.error:
+            pass
+
+        if not rows:
+            msg = "No Claude/Copilot/Codex sessions for this folder. n=claude  c=copilot  x=codex  q=quit"
+            try:
+                stdscr.addnstr(h // 2, max(0, (w - len(msg)) // 2), msg, w)
+            except curses.error:
+                pass
+        else:
+            body_h = h - 2
+            if sel < top: top = sel
+            if sel >= top + body_h: top = sel - body_h + 1
+
+            for i in range(top, min(len(rows), top + body_h)):
+                ensure_meta(i)
+                r = rows[i]
+                when = human_when(r.mtime)
+                age = human_age(r.mtime).rjust(4)
+                turns = f"{r.turns:>4}t"
+                size = human_size(r.size).rjust(5) if r.size else "    ·"
+                glyph = PROVIDER_GLYPH[r.provider]
+                snippet = r.snippet or ""
+                short_id = r.uuid[:6]
+                selected = (i == sel)
+                base = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
+                dim = base if selected else curses.color_pair(3)
+                # Single-line, mixed attrs: prominent timestamp, dimmed hash trailer.
+                row_y = 1 + i - top
+                try:
+                    stdscr.move(row_y, 0)
+                    stdscr.addnstr(f" {glyph} {when}  {age}  {turns}  {size}  ", w, base)
+                    remaining = w - stdscr.getyx()[1]
+                    if remaining > 10:
+                        snip_w = remaining - 8  # leave 6 for hash + 2 spaces
+                        stdscr.addnstr(snippet.ljust(snip_w), snip_w, base)
+                        stdscr.addnstr("  " + short_id, 8, dim)
+                    elif remaining > 0:
+                        stdscr.addnstr(snippet, remaining, base)
+                    # Pad rest of line so selection highlight fills the row.
+                    cur_x = stdscr.getyx()[1]
+                    if cur_x < w:
+                        stdscr.addnstr(" " * (w - cur_x), w - cur_x, base)
+                except curses.error:
+                    pass
+
+        stdscr.refresh()
+        try:
+            k = stdscr.getch()
+        except KeyboardInterrupt:
+            return ("quit", None, None)
+
+        if k == -1:
+            # timeout tick → refresh if at least REFRESH_MS elapsed
+            if time.time() - last_refresh >= REFRESH_MS / 1000.0:
+                if rows and 0 <= sel < len(rows):
+                    sel_key = keyfor(rows[sel])
+                fresh = list_all(folder)
+                # carry over loaded snippets so we don't re-parse JSONLs every tick
+                cache = {(r.provider, r.uuid): r for r in rows}
+                for r in fresh:
+                    old = cache.get((r.provider, r.uuid))
+                    if old and old.mtime == r.mtime and old.snippet is not None:
+                        r.snippet = old.snippet
+                        r.turns = old.turns
+                rows = fresh
+                re_select()
+                last_refresh = time.time()
+            continue
+
+        if k in (curses.KEY_UP, ord('k')):
+            if rows: sel = (sel - 1) % len(rows)
+        elif k in (curses.KEY_DOWN, ord('j')):
+            if rows: sel = (sel + 1) % len(rows)
+        elif k in (curses.KEY_HOME, ord('g')):
+            sel = 0
+        elif k in (curses.KEY_END, ord('G')):
+            if rows: sel = len(rows) - 1
+        elif k == curses.KEY_PPAGE:
+            sel = max(0, sel - (h - 3))
+        elif k == curses.KEY_NPAGE:
+            if rows: sel = min(len(rows) - 1, sel + (h - 3))
+        elif k in (10, 13, curses.KEY_ENTER):
+            if rows:
+                r = rows[sel]
+                return ("resume", r.provider, r.uuid)
+        elif k in (ord('n'), ord('N')):
+            return ("new", "claude", None)
+        elif k in (ord('c'), ord('C')):
+            return ("new", "copilot", None)
+        elif k in (ord('x'), ord('X')):
+            return ("new", "codex", None)
+        elif k in (ord('q'), ord('Q'), 27):
+            return ("quit", None, None)
+
+        if rows and 0 <= sel < len(rows):
+            sel_key = keyfor(rows[sel])
+
+
+def main():
+    folder = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
+    if not os.path.isdir(folder):
+        print(f"sessions: not a directory: {folder}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        action, provider, uuid = curses.wrapper(run_picker, folder)
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+    if action == "quit":
+        sys.exit(0)
+
+    os.chdir(folder)
+    argv = resume_argv(provider, uuid) if action == "resume" else new_argv(provider)
+    os.execvp(argv[0], argv)
+
+
+if __name__ == "__main__":
+    main()
