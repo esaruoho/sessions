@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-sessions — TUI session picker for Claude Code, GitHub Copilot CLI, OpenAI Codex CLI, and Converse.
+sessions — TUI session picker for Claude Code, GitHub Copilot CLI, OpenAI Codex CLI,
+and FoundationModels (the fm-chat on-device LLM).
 
 Upstream: https://github.com/esaruoho/sessions
 This file is the apple-repo copy; the standalone repo above is the canonical
@@ -9,11 +10,11 @@ home when the two diverge.
 Usage:
     sessions [folder]
 
-Run inside (or pass) a project folder. Lists every session any of the three
+Run inside (or pass) a project folder. Lists every session any of the four
 agents has for that folder, newest-first. Cursor up/down to select, Enter
 resumes with the right CLI + flags, n starts a new claude session, c starts
-a new copilot, x starts a new codex, q/Esc/Ctrl-C quits. Auto-refreshes
-every ~1.5 s.
+a new copilot, x starts a new codex, f starts a new fm-chat (FoundationModels),
+q/Esc/Ctrl-C quits. Auto-refreshes every ~1.5 s.
 
 Per-provider mapping:
   • Claude   ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
@@ -24,11 +25,9 @@ Per-provider mapping:
   • Codex    ~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl
              first line is session_meta with `cwd` and `id`
              resume: codex resume <uuid>
-  • Converse ~/work/converse/sessions/<stamp>/livefile.jsonl
-             Append-only event log; first transcript.appended is the snippet.
-             resume: open -a Converse <session-dir>  (Converse replays via openFiles:)
-             Converse sessions are global (not folder-scoped) — they ALWAYS
-             show up regardless of which folder the picker was launched in.
+  • fm-chat  ~/.fm-chat/sessions/<uuid>.jsonl  (FoundationModels on-device LLM)
+             first line session_meta with cwd+uuid, then {role,content} messages
+             resume: fm-chat --resume <uuid>
 
 Apple-native: stdlib only. No Homebrew, no pip.
 """
@@ -53,7 +52,7 @@ class Row:
     __slots__ = ("provider", "uuid", "cwd", "path", "mtime", "size", "turns", "snippet", "title", "lineage")
 
     def __init__(self, provider, uuid, cwd, path, mtime, size=0, turns=0, snippet=None, title=None, lineage=None):
-        self.provider = provider   # "claude" | "copilot" | "codex" | "converse"
+        self.provider = provider   # "claude" | "copilot" | "codex" | "fm-chat"
         self.uuid = uuid
         self.cwd = cwd
         self.path = path           # jsonl path, or sqlite db path for copilot
@@ -62,8 +61,8 @@ class Row:
         self.turns = turns
         self.snippet = snippet     # lazy; None means not yet loaded — first user prompt
         self.title = title         # user-set rename / summary, if any
-        self.lineage = lineage     # e.g. "← converse 2026-06-01-141737" — set if this
-                                   # session was spawned by another tool
+        self.lineage = lineage     # reserved: provenance tag if a session was
+                                   # spawned by another tool (currently unused)
 
 
 # ─────────────────────────── Claude ──────────────────────────────────
@@ -264,103 +263,6 @@ def load_codex_meta(row):
     row.snippet = (snippet or "(empty)")[:200]
 
 
-# ─────────────────────────── Converse ────────────────────────────────
-
-CONVERSE_SESSIONS_DIR = f"{HOME}/work/converse/sessions"
-
-
-def build_converse_lineage():
-    """Scan every Converse livefile for claude_session_id values. Return
-    { claude_uuid → converse_stamp } so a Claude row in the picker can be
-    badged with which Converse session spawned it."""
-    index = {}
-    try:
-        for stamp in os.listdir(CONVERSE_SESSIONS_DIR):
-            lf = os.path.join(CONVERSE_SESSIONS_DIR, stamp, "livefile.jsonl")
-            if not os.path.isfile(lf):
-                continue
-            try:
-                with open(lf, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        try: d = json.loads(line)
-                        except Exception: continue
-                        if d.get("type") != "agent.responded":
-                            continue
-                        # v0.5+: claude_session_id ;  pre-rename: session_id
-                        sid = d.get("claude_session_id") or d.get("session_id")
-                        if sid and len(sid) >= 32 and "-" in sid and sid not in index:
-                            index[sid] = stamp
-            except OSError:
-                continue
-    except FileNotFoundError:
-        pass
-    return index
-
-
-_CONVERSE_LINEAGE_CACHE = None
-_CONVERSE_LINEAGE_TS = 0
-def converse_lineage():
-    global _CONVERSE_LINEAGE_CACHE, _CONVERSE_LINEAGE_TS
-    now = time.time()
-    if _CONVERSE_LINEAGE_CACHE is None or now - _CONVERSE_LINEAGE_TS > 3:
-        _CONVERSE_LINEAGE_CACHE = build_converse_lineage()
-        _CONVERSE_LINEAGE_TS = now
-    return _CONVERSE_LINEAGE_CACHE
-
-
-def list_converse(_folder):
-    """List Converse sessions. Folder-agnostic — Converse is a global tool."""
-    rows = []
-    try:
-        names = os.listdir(CONVERSE_SESSIONS_DIR)
-    except FileNotFoundError:
-        return rows
-    for name in names:
-        full_dir = os.path.join(CONVERSE_SESSIONS_DIR, name)
-        livefile = os.path.join(full_dir, "livefile.jsonl")
-        if not os.path.isfile(livefile):
-            continue
-        try:
-            st = os.stat(livefile)
-        except OSError:
-            continue
-        # Per the README convention: `path` is the *session dir* for Converse
-        # (not the livefile), because that's what `open -a Converse` consumes.
-        rows.append(Row("converse", name, "(global)", full_dir, st.st_mtime, st.st_size))
-    return rows
-
-
-def load_converse_meta(row):
-    """Read livefile.jsonl to extract a snippet and a turn count."""
-    snippet = None
-    turns = 0
-    livefile = os.path.join(row.path, "livefile.jsonl")
-    try:
-        with open(livefile, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                t = d.get("type")
-                # Count user-meaningful turns: transcript.appended OR
-                # agent.responded OR text.inserted (typed) are all "turns".
-                if t in ("transcript.appended", "agent.responded", "text.inserted"):
-                    turns += 1
-                # First transcript.appended body is the headline snippet.
-                if snippet is None and t == "transcript.appended":
-                    b = d.get("body")
-                    if isinstance(b, str) and b.strip():
-                        snippet = b.strip().replace("\n", " ")
-    except FileNotFoundError:
-        pass
-    row.turns = turns
-    row.snippet = (snippet or "(no transcript yet)")[:200]
-
-
 # ─────────────────────────── fm-chat ─────────────────────────────────
 # Apple on-device LLM chats (the `fm-chat` CLI) persisted to ~/.fm-chat/sessions/.
 # Each file: line 1 session_meta {uuid,cwd,...}, then message lines {role,content}.
@@ -417,7 +319,6 @@ LOAD = {
     "claude":   load_claude_meta,
     "copilot":  load_copilot_meta,
     "codex":    load_codex_meta,
-    "converse": load_converse_meta,
     "fm-chat":  load_fmchat_meta,
 }
 
@@ -427,7 +328,6 @@ def list_all(folder):
     rows.extend(list_claude(folder))
     rows.extend(list_copilot(folder))
     rows.extend(list_codex(folder))
-    rows.extend(list_converse(folder))
     rows.extend(list_fmchat(folder))
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
@@ -485,7 +385,7 @@ def human_size(n):
     return f"{n/1024/1024:.1f}M"
 
 
-PROVIDER_GLYPH = {"claude": "C", "copilot": "G", "codex": "X", "converse": "V", "fm-chat": "F"}
+PROVIDER_GLYPH = {"claude": "C", "copilot": "G", "codex": "X", "fm-chat": "F"}
 
 
 def find_bin(name, extra_paths=()):
@@ -508,10 +408,6 @@ def resume_argv(provider, uuid, path=None):
         return [find_bin("copilot"), f"--resume={uuid}"]
     if provider == "codex":
         return [find_bin("codex"), "resume", uuid]
-    if provider == "converse":
-        # `open -a Converse <session-dir>` — Converse handles the path via
-        # NSApplicationDelegate.application(_:openFiles:) and replays it.
-        return ["/usr/bin/open", "-a", "/Applications/Converse.app", path]
     if provider == "fm-chat":
         return [find_bin("fm-chat", (f"{HOME}/work/apple/bin/fm-chat",)), "--resume", uuid]
     raise ValueError(provider)
@@ -524,8 +420,6 @@ def new_argv(provider):
         return [find_bin("copilot")]
     if provider == "codex":
         return [find_bin("codex")]
-    if provider == "converse":
-        return ["/usr/bin/open", "-a", "/Applications/Converse.app"]
     if provider == "fm-chat":
         return [find_bin("fm-chat", (f"{HOME}/work/apple/bin/fm-chat",))]
     raise ValueError(provider)
@@ -548,7 +442,6 @@ def run_picker(stdscr, folder):
         curses.init_pair(4, curses.COLOR_YELLOW, -1)                # claude
         curses.init_pair(5, curses.COLOR_GREEN, -1)                 # copilot
         curses.init_pair(6, curses.COLOR_MAGENTA, -1)               # codex
-        curses.init_pair(7, curses.COLOR_CYAN, -1)                  # converse
     except Exception:
         pass
 
@@ -562,10 +455,6 @@ def run_picker(stdscr, folder):
         r = rows[i]
         if r.snippet is None:
             LOAD[r.provider](r)
-        # Lineage badge: was this Claude session spawned by Converse?
-        if r.lineage is None and r.provider == "claude":
-            spawn = converse_lineage().get(r.uuid)
-            r.lineage = f"← converse {spawn}" if spawn else ""
 
     def keyfor(r):
         return (r.provider, r.uuid)
@@ -588,10 +477,10 @@ def run_picker(stdscr, folder):
         cn = sum(1 for r in rows if r.provider == "claude")
         gn = sum(1 for r in rows if r.provider == "copilot")
         xn = sum(1 for r in rows if r.provider == "codex")
-        vn = sum(1 for r in rows if r.provider == "converse")
+        fn = sum(1 for r in rows if r.provider == "fm-chat")
         disp = folder.replace(HOME, "~", 1) if folder.startswith(HOME) else folder
-        header = f" sessions · {disp}   C:{cn} G:{gn} X:{xn} V:{vn}"
-        footer = " ↑/↓ select · ⏎ resume · n claude · c copilot · x codex · v converse · q quit · auto-refresh"
+        header = f" sessions · {disp}   C:{cn} G:{gn} X:{xn} F:{fn}"
+        footer = " ↑/↓ select · ⏎ resume · n claude · c copilot · x codex · f fm-chat · q quit · auto-refresh"
         try:
             stdscr.addnstr(0, 0, header.ljust(w), w, curses.color_pair(2) | curses.A_BOLD)
             stdscr.addnstr(h - 1, 0, footer.ljust(w), w - 1, curses.color_pair(3))
@@ -599,7 +488,7 @@ def run_picker(stdscr, folder):
             pass
 
         if not rows:
-            msg = "No sessions for this folder. n=claude  c=copilot  x=codex  v=converse  q=quit"
+            msg = "No sessions for this folder. n=claude  c=copilot  x=codex  f=fm-chat  q=quit"
             try:
                 stdscr.addnstr(h // 2, max(0, (w - len(msg)) // 2), msg, w)
             except curses.error:
@@ -618,9 +507,6 @@ def run_picker(stdscr, folder):
                 size = human_size(r.size).rjust(5) if r.size else "    ·"
                 glyph = PROVIDER_GLYPH[r.provider]
                 snippet = r.snippet or ""
-                # Prefix snippet with lineage tag if Converse spawned this Claude session.
-                if r.lineage:
-                    snippet = f"{r.lineage}  {snippet}"
                 short_id = r.uuid[:6]
                 selected = (i == sel)
                 base = curses.color_pair(1) | curses.A_BOLD if selected else curses.A_NORMAL
@@ -700,8 +586,6 @@ def run_picker(stdscr, folder):
             return ("new", "copilot", None, None)
         elif k in (ord('x'), ord('X')):
             return ("new", "codex", None, None)
-        elif k in (ord('v'), ord('V')):
-            return ("new", "converse", None, None)
         elif k in (ord('f'), ord('F')):
             return ("new", "fm-chat", None, None)
         elif k in (ord('q'), ord('Q'), 27):
@@ -714,7 +598,7 @@ def run_picker(stdscr, folder):
 # ─────────────────────────── CLI subcommands ─────────────────────────
 #
 # Doctrine: every conversation across every provider is queryable text.
-# From inside Claude / Codex / Converse / a plain shell, you can pull any
+# From inside Claude / Codex / Copilot / a plain shell, you can pull any
 # past session into the current context via `!sessions cat <id>`.
 
 def all_rows_global():
@@ -767,7 +651,6 @@ def all_rows_global():
                         rows.append(Row("codex", sid, "(unknown)", full, st.st_mtime, st.st_size))
     except FileNotFoundError:
         pass
-    rows.extend(list_converse(None))
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
 
@@ -839,23 +722,16 @@ def render_session(row):
             ):
                 out.append(f"\n## {role.upper()}\n{str(content).strip()}")
             con.close()
-        elif row.provider == "converse":
-            with open(os.path.join(row.path, "livefile.jsonl"), "r",
-                     encoding="utf-8", errors="replace") as f:
+        elif row.provider == "fm-chat":
+            with open(row.path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try: d = json.loads(line)
                     except Exception: continue
-                    t = d.get("type")
-                    body = d.get("body")
-                    src = d.get("source", "")
-                    if t == "transcript.appended" and body:
-                        out.append(f"\n## {src.upper()}\n{body}")
-                    elif t == "agent.responded" and body:
-                        agent = d.get("agent", "agent")
-                        instr = d.get("instruction", "")
-                        out.append(f"\n## AGENT ({agent})\nINSTRUCTION: {instr}\n\n{body}")
-                    elif t == "text.inserted" and body:
-                        out.append(f"\n## KEYBOARD\n{body}")
+                    if d.get("type") == "message":
+                        role = d.get("role", "?")
+                        c = d.get("content", "")
+                        if str(c).strip():
+                            out.append(f"\n## {role.upper()}\n{str(c).strip()}")
     except FileNotFoundError:
         out.append(f"(file not found: {row.path})")
     return "\n".join(out)
@@ -877,9 +753,6 @@ def ensure_meta_for(r):
     if r.snippet is None:
         try: LOAD[r.provider](r)
         except Exception: r.snippet = ""
-    if r.lineage is None and r.provider == "claude":
-        spawn = converse_lineage().get(r.uuid)
-        r.lineage = f"← converse {spawn}" if spawn else ""
 
 
 def cmd_cat(args):
@@ -994,20 +867,7 @@ def call_claude(prompt, cwd=None, timeout=180):
 
 def infer_topic(row):
     """Pick the vault subfolder for this session."""
-    if row.provider == "converse":
-        lf = os.path.join(row.path, "livefile.jsonl")
-        if os.path.exists(lf):
-            try:
-                with open(lf, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        try: d = json.loads(line)
-                        except Exception: continue
-                        cwd = d.get("agent_cwd") or ""
-                        if cwd:
-                            return os.path.basename(cwd.rstrip("/")) or "general"
-            except OSError:
-                pass
-    elif row.cwd and row.cwd not in ("(global)", "(unknown)"):
+    if row.cwd and row.cwd not in ("(global)", "(unknown)"):
         return os.path.basename(row.cwd.rstrip("/")) or "general"
     return "general"
 
@@ -1481,11 +1341,11 @@ Usage:
               [--raw] [--top N]       (Apple NaturalLanguage embeddings, on-device).
               [--threshold X]         --raw searches full transcripts (newest 30).
 
-Providers:  claude (C) · copilot (G) · codex (X) · converse (V)
-IDs match any uuid / prefix / Converse stamp. Use a 6-char prefix in practice.
+Providers:  claude (C) · copilot (G) · codex (X) · fm-chat (F)
+IDs match any uuid / prefix. Use a 6-char prefix in practice.
 
 Doctrine — memory promotion chain (ENVOY):
-  raw transcript   (the native log — claude .jsonl, livefile.jsonl, etc.)
+  raw transcript   (the native log — claude .jsonl, fm-chat .jsonl, etc.)
     → distilled    (cheap digest, local cache)
     → promoted     (lives in the cc-vault, addressable knowledge)
 
