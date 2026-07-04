@@ -1,0 +1,9 @@
+# Generated demo fixture (rebuilt by demo/make-fixture.py at record time)
+demo/home/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS cruft
+.DS_Store
