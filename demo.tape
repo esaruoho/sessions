@@ -7,9 +7,10 @@
 #   brew install vhs                 # https://github.com/charmbracelet/vhs
 #   vhs demo.tape                    # → demo.gif
 #
-# demo/make-fixture.py builds a fake $HOME with a handful of FAKE sessions across all three
-# agents (Claude / Copilot / Codex) so the picker has something realistic — but private-data
-# free — to show. It runs inside the Hidden block so the ages ("12m", "3h", …) are fresh.
+# demo/make-fixture.py builds a fake $HOME with a handful of FAKE sessions across all four
+# providers (Claude / Copilot / Codex / Gemini) so the picker has something
+# realistic — but private-data free — to show. It runs inside the Hidden block so the ages
+# ("12m", "3h", …) are fresh.
 
 Output demo.gif
 

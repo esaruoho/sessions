@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 sessions — TUI session picker for Claude Code, GitHub Copilot CLI, OpenAI Codex CLI,
-and FoundationModels (the fm-chat on-device LLM).
+and Google Gemini CLI.
 
 Upstream: https://github.com/esaruoho/sessions
 This file is the apple-repo copy; the standalone repo above is the canonical
@@ -13,7 +13,7 @@ Usage:
 Run inside (or pass) a project folder. Lists every session any of the four
 agents has for that folder, newest-first. Cursor up/down to select, Enter
 resumes with the right CLI + flags, n starts a new claude session, c starts
-a new copilot, x starts a new codex, f starts a new fm-chat (FoundationModels),
+a new copilot, x starts a new codex, m starts a new Gemini session,
 q/Esc/Ctrl-C quits. Auto-refreshes every ~1.5 s.
 
 Per-provider mapping:
@@ -25,9 +25,9 @@ Per-provider mapping:
   • Codex    ~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl
              first line is session_meta with `cwd` and `id`
              resume: codex resume <uuid>
-  • fm-chat  ~/.fm-chat/sessions/<uuid>.jsonl  (FoundationModels on-device LLM)
-             first line session_meta with cwd+uuid, then {role,content} messages
-             resume: fm-chat --resume <uuid>
+  • Gemini   ~/.gemini/tmp/<project>/chats/session-*-<shortid>.jsonl
+             project root lives in ~/.gemini/tmp/<project>/.project_root
+             resume: gemini --resume <uuid>
 
 Apple-native: stdlib only. No Homebrew, no pip.
 """
@@ -54,7 +54,7 @@ class Row:
     __slots__ = ("provider", "uuid", "cwd", "path", "mtime", "size", "turns", "snippet", "title", "lineage")
 
     def __init__(self, provider, uuid, cwd, path, mtime, size=0, turns=0, snippet=None, title=None, lineage=None):
-        self.provider = provider   # "claude" | "copilot" | "codex" | "fm-chat"
+        self.provider = provider   # "claude" | "copilot" | "codex" | "gemini"
         self.uuid = uuid
         self.cwd = cwd
         self.path = path           # jsonl path, or sqlite db path for copilot
@@ -188,7 +188,35 @@ def list_copilot(folder):
 
 
 def load_copilot_meta(row):
-    # Already populated during list_copilot — snippet/turns come from SQL.
+    if row.snippet is not None:
+        return
+    if not os.path.isfile(COPILOT_DB):
+        row.snippet = "(empty)"
+        return
+    try:
+        con = sqlite3.connect(f"file:{COPILOT_DB}?mode=ro&immutable=1", uri=True)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(turns)")}
+        if "user_message" in cols:
+            row.turns = con.execute(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ?", (row.uuid,)
+            ).fetchone()[0]
+            first = con.execute(
+                "SELECT user_message FROM turns WHERE session_id = ? ORDER BY turn_index ASC LIMIT 1",
+                (row.uuid,)
+            ).fetchone()
+            row.snippet = ((first[0] if first else None) or row.title or "(empty)").strip().replace("\n", " ")[:200]
+        elif {"role", "content"}.issubset(cols):
+            row.turns = con.execute(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ? AND role = 'user'", (row.uuid,)
+            ).fetchone()[0]
+            first = con.execute(
+                "SELECT content FROM turns WHERE session_id = ? AND role = 'user' ORDER BY created_at LIMIT 1",
+                (row.uuid,)
+            ).fetchone()
+            row.snippet = ((first[0] if first else None) or row.title or "(empty)").strip().replace("\n", " ")[:200]
+        con.close()
+    except sqlite3.Error:
+        row.snippet = "(empty)"
     if row.snippet is None:
         row.snippet = "(empty)"
 
@@ -276,38 +304,71 @@ def load_codex_meta(row):
     row.snippet = (snippet or "(empty)")[:200]
 
 
-# ─────────────────────────── fm-chat ─────────────────────────────────
-# Apple on-device LLM chats (the `fm-chat` CLI) persisted to ~/.fm-chat/sessions/.
-# Each file: line 1 session_meta {uuid,cwd,...}, then message lines {role,content}.
-FMCHAT_ROOT = f"{HOME}/.fm-chat/sessions"
+# ─────────────────────────── Gemini ──────────────────────────────────
+
+GEMINI_TMP_ROOT = f"{HOME}/.gemini/tmp"
 
 
-def list_fmchat(folder):
-    if not os.path.isdir(FMCHAT_ROOT):
+def _gemini_project_root(project_dir):
+    try:
+        with open(os.path.join(project_dir, ".project_root"), "r", encoding="utf-8", errors="replace") as f:
+            return f.readline().strip()
+    except OSError:
+        return None
+
+
+def _gemini_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for x in content:
+            if isinstance(x, dict):
+                if isinstance(x.get("text"), str):
+                    parts.append(x["text"])
+                elif isinstance(x.get("functionResponse"), dict):
+                    name = x["functionResponse"].get("name")
+                    if name:
+                        parts.append(f"[tool result: {name}]")
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def list_gemini(folder):
+    if not os.path.isdir(GEMINI_TMP_ROOT):
         return []
     resolved = os.path.realpath(folder)
     rows = []
-    for name in os.listdir(FMCHAT_ROOT):
-        if not name.endswith(".jsonl"):
+    for project in os.listdir(GEMINI_TMP_ROOT):
+        project_dir = os.path.join(GEMINI_TMP_ROOT, project)
+        chats_dir = os.path.join(project_dir, "chats")
+        if not os.path.isdir(chats_dir):
             continue
-        full = os.path.join(FMCHAT_ROOT, name)
-        try:
-            st = os.stat(full)
-            with open(full, "r", encoding="utf-8", errors="replace") as f:
-                meta = json.loads(f.readline())
-        except Exception:
+        cwd = _gemini_project_root(project_dir)
+        if not cwd or os.path.realpath(cwd) != resolved:
             continue
-        if meta.get("type") != "session_meta":
-            continue
-        cwd, uid = meta.get("cwd"), meta.get("uuid")
-        if not cwd or not uid or os.path.realpath(cwd) != resolved:
-            continue
-        rows.append(Row("fm-chat", uid, cwd, full, st.st_mtime, st.st_size))
+        for name in os.listdir(chats_dir):
+            if not (name.startswith("session-") and (name.endswith(".jsonl") or name.endswith(".json"))):
+                continue
+            full = os.path.join(chats_dir, name)
+            try:
+                st = os.stat(full)
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    first = json.loads(f.readline())
+            except Exception:
+                continue
+            sid = first.get("sessionId")
+            if not sid or first.get("kind") == "subagent":
+                continue
+            mtime = parse_iso(first.get("lastUpdated")) or st.st_mtime
+            rows.append(Row("gemini", sid, cwd, full, mtime, st.st_size))
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
 
 
-def load_fmchat_meta(row):
+def load_gemini_meta(row):
     snippet, turns = None, 0
     try:
         with open(row.path, "r", encoding="utf-8", errors="replace") as f:
@@ -316,10 +377,21 @@ def load_fmchat_meta(row):
                     d = json.loads(line)
                 except Exception:
                     continue
-                if d.get("type") == "message" and d.get("role") == "user":
+                records = []
+                if "$set" in d and isinstance(d["$set"], dict):
+                    records.extend(d["$set"].get("messages") or [])
+                elif d.get("type"):
+                    records.append(d)
+                for msg in records:
+                    role = msg.get("type")
+                    if role != "user":
+                        continue
+                    text = _gemini_text(msg.get("content")).strip().replace("\n", " ")
+                    if not text or text.startswith("<session_context>") or text.startswith("[tool result:"):
+                        continue
                     turns += 1
                     if snippet is None:
-                        snippet = (d.get("content") or "").strip().replace("\n", " ")
+                        snippet = text
     except FileNotFoundError:
         pass
     row.turns = turns
@@ -332,7 +404,7 @@ LOAD = {
     "claude":   load_claude_meta,
     "copilot":  load_copilot_meta,
     "codex":    load_codex_meta,
-    "fm-chat":  load_fmchat_meta,
+    "gemini":   load_gemini_meta,
 }
 
 
@@ -341,7 +413,7 @@ def list_all(folder):
     rows.extend(list_claude(folder))
     rows.extend(list_copilot(folder))
     rows.extend(list_codex(folder))
-    rows.extend(list_fmchat(folder))
+    rows.extend(list_gemini(folder))
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
 
@@ -398,7 +470,7 @@ def human_size(n):
     return f"{n/1024/1024:.1f}M"
 
 
-PROVIDER_GLYPH = {"claude": "C", "copilot": "G", "codex": "X", "fm-chat": "F"}
+PROVIDER_GLYPH = {"claude": "C", "copilot": "P", "codex": "X", "gemini": "G"}
 
 
 def find_bin(name, extra_paths=()):
@@ -421,8 +493,8 @@ def resume_argv(provider, uuid, path=None):
         return [find_bin("copilot"), f"--resume={uuid}"]
     if provider == "codex":
         return [find_bin("codex"), "resume", uuid]
-    if provider == "fm-chat":
-        return [find_bin("fm-chat", (f"{HOME}/work/apple/bin/fm-chat",)), "--resume", uuid]
+    if provider == "gemini":
+        return [find_bin("gemini"), "--resume", uuid]
     raise ValueError(provider)
 
 
@@ -433,8 +505,8 @@ def new_argv(provider):
         return [find_bin("copilot")]
     if provider == "codex":
         return [find_bin("codex")]
-    if provider == "fm-chat":
-        return [find_bin("fm-chat", (f"{HOME}/work/apple/bin/fm-chat",))]
+    if provider == "gemini":
+        return [find_bin("gemini")]
     raise ValueError(provider)
 
 
@@ -488,12 +560,12 @@ def run_picker(stdscr, folder):
         stdscr.erase()
 
         cn = sum(1 for r in rows if r.provider == "claude")
-        gn = sum(1 for r in rows if r.provider == "copilot")
+        pn = sum(1 for r in rows if r.provider == "copilot")
         xn = sum(1 for r in rows if r.provider == "codex")
-        fn = sum(1 for r in rows if r.provider == "fm-chat")
+        gn = sum(1 for r in rows if r.provider == "gemini")
         disp = folder.replace(HOME, "~", 1) if folder.startswith(HOME) else folder
-        header = f" sessions · {disp}   C:{cn} G:{gn} X:{xn} F:{fn}"
-        footer = " ↑/↓ select · ⏎ resume · n claude · c copilot · x codex · f fm-chat · q quit · auto-refresh"
+        header = f" sessions · {disp}   C:{cn} P:{pn} X:{xn} G:{gn}"
+        footer = " ↑/↓ select · ⏎ resume · n claude · c copilot · x codex · m gemini · q quit · auto-refresh"
         try:
             stdscr.addnstr(0, 0, header.ljust(w), w, curses.color_pair(2) | curses.A_BOLD)
             stdscr.addnstr(h - 1, 0, footer.ljust(w), w - 1, curses.color_pair(3))
@@ -501,7 +573,7 @@ def run_picker(stdscr, folder):
             pass
 
         if not rows:
-            msg = "No sessions for this folder. n=claude  c=copilot  x=codex  f=fm-chat  q=quit"
+            msg = "No sessions for this folder. n=claude  c=copilot  x=codex  m=gemini  q=quit"
             try:
                 stdscr.addnstr(h // 2, max(0, (w - len(msg)) // 2), msg, w)
             except curses.error:
@@ -599,8 +671,8 @@ def run_picker(stdscr, folder):
             return ("new", "copilot", None, None)
         elif k in (ord('x'), ord('X')):
             return ("new", "codex", None, None)
-        elif k in (ord('f'), ord('F')):
-            return ("new", "fm-chat", None, None)
+        elif k in (ord('m'), ord('M')):
+            return ("new", "gemini", None, None)
         elif k in (ord('q'), ord('Q'), 27):
             return ("quit", None, None, None)
 
@@ -639,11 +711,14 @@ def all_rows_global():
     if os.path.isfile(COPILOT_DB):
         try:
             con = sqlite3.connect(f"file:{COPILOT_DB}?mode=ro&immutable=1", uri=True)
-            for sid, cwd, ts, _name in con.execute(
-                "SELECT id, working_directory, updated_at, name FROM sessions"
+            cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+            cwd_col = "cwd" if "cwd" in cols else "working_directory"
+            title_col = "summary" if "summary" in cols else ("name" if "name" in cols else "''")
+            for sid, cwd, ts, title in con.execute(
+                f"SELECT id, {cwd_col}, updated_at, {title_col} FROM sessions"
             ):
                 rows.append(Row("copilot", sid, cwd or "(unknown)", COPILOT_DB,
-                                 parse_iso(ts), 0))
+                                 parse_iso(ts), 0, title=(title or None)))
             con.close()
         except sqlite3.Error:
             pass
@@ -656,10 +731,47 @@ def all_rows_global():
             full = os.path.join(ddir, n)
             try:
                 st = os.stat(full)
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    first = json.loads(f.readline())
             except OSError:
                 continue
-            sid = n.rsplit("-", 1)[-1][:-6]
-            rows.append(Row("codex", sid, "(unknown)", full, st.st_mtime, st.st_size))
+            except Exception:
+                first = {}
+            payload = first.get("payload") or {}
+            source = payload.get("source") or {}
+            if "subagent" in source:
+                continue
+            sid = payload.get("id") or n[len("rollout-"):-len(".jsonl")].rsplit("-", 5)[0]
+            cwd = payload.get("cwd") or "(unknown)"
+            title = payload.get("agent_nickname")
+            rows.append(Row("codex", sid, cwd, full, st.st_mtime, st.st_size,
+                            title=title[:80] if title else None))
+    if os.path.isdir(GEMINI_TMP_ROOT):
+        try:
+            for project in os.listdir(GEMINI_TMP_ROOT):
+                project_dir = os.path.join(GEMINI_TMP_ROOT, project)
+                chats_dir = os.path.join(project_dir, "chats")
+                if not os.path.isdir(chats_dir):
+                    continue
+                cwd = _gemini_project_root(project_dir) or "(unknown)"
+                for n in os.listdir(chats_dir):
+                    if not (n.startswith("session-") and (n.endswith(".jsonl") or n.endswith(".json"))):
+                        continue
+                    full = os.path.join(chats_dir, n)
+                    try:
+                        st = os.stat(full)
+                        with open(full, "r", encoding="utf-8", errors="replace") as f:
+                            first = json.loads(f.readline())
+                    except Exception:
+                        continue
+                    sid = first.get("sessionId")
+                    if not sid or first.get("kind") == "subagent":
+                        continue
+                    rows.append(Row("gemini", sid, cwd, full,
+                                    parse_iso(first.get("lastUpdated")) or st.st_mtime,
+                                    st.st_size))
+        except OSError:
+            pass
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
 
@@ -749,22 +861,44 @@ def render_session(row):
                     out.append(f"\n## {role.upper()}\n{str(content).strip()}")
         elif row.provider == "copilot":
             con = sqlite3.connect(f"file:{COPILOT_DB}?mode=ro&immutable=1", uri=True)
-            for role, content in con.execute(
-                "SELECT role, content FROM turns WHERE session_id = ? ORDER BY created_at",
-                (row.uuid,)
-            ):
-                out.append(f"\n## {role.upper()}\n{str(content).strip()}")
+            cols = {r[1] for r in con.execute("PRAGMA table_info(turns)")}
+            if {"role", "content"}.issubset(cols):
+                for role, content in con.execute(
+                    "SELECT role, content FROM turns WHERE session_id = ? ORDER BY created_at",
+                    (row.uuid,)
+                ):
+                    out.append(f"\n## {role.upper()}\n{str(content).strip()}")
+            else:
+                order_col = "turn_index" if "turn_index" in cols else "timestamp"
+                response_col = "assistant_response" if "assistant_response" in cols else "NULL"
+                for user_msg, assistant_msg in con.execute(
+                    f"SELECT user_message, {response_col} FROM turns WHERE session_id = ? ORDER BY {order_col}",
+                    (row.uuid,)
+                ):
+                    if user_msg:
+                        out.append(f"\n## USER\n{str(user_msg).strip()}")
+                    if assistant_msg:
+                        out.append(f"\n## ASSISTANT\n{str(assistant_msg).strip()}")
             con.close()
-        elif row.provider == "fm-chat":
+        elif row.provider == "gemini":
             with open(row.path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try: d = json.loads(line)
                     except Exception: continue
-                    if d.get("type") == "message":
-                        role = d.get("role", "?")
-                        c = d.get("content", "")
-                        if str(c).strip():
-                            out.append(f"\n## {role.upper()}\n{str(c).strip()}")
+                    records = []
+                    if "$set" in d and isinstance(d["$set"], dict):
+                        records.extend(d["$set"].get("messages") or [])
+                    elif d.get("type"):
+                        records.append(d)
+                    for msg in records:
+                        role = msg.get("type")
+                        if role not in ("user", "gemini"):
+                            continue
+                        c = _gemini_text(msg.get("content")).strip()
+                        if not c or c.startswith("<session_context>") or c.startswith("[tool result:"):
+                            continue
+                        heading = "ASSISTANT" if role == "gemini" else "USER"
+                        out.append(f"\n## {heading}\n{c}")
     except FileNotFoundError:
         out.append(f"(file not found: {row.path})")
     return "\n".join(out)
@@ -993,7 +1127,7 @@ def cmd_open(args):
     # Resume is folder-scoped for claude/copilot/codex — the CLI looks up the
     # session relative to the cwd it's launched from. So chdir into the folder
     # the session actually ran in, otherwise `open` reports "no such session"
-    # from anywhere but that one directory. (converse is global; no cwd needed.)
+    # from anywhere but that one directory.
     ensure_meta_for(r)
     if r.cwd and r.cwd.startswith("/"):
         if os.path.isdir(r.cwd):
@@ -1562,12 +1696,12 @@ Usage:
               [--raw] [--top N]       (Apple NaturalLanguage embeddings, on-device).
               [--threshold X]         --raw searches full transcripts (newest 30).
 
-Providers:  claude (C) · copilot (G) · codex (X) · fm-chat (F)
+Providers:  claude (C) · copilot (P) · codex (X) · gemini (G)
 IDs match any uuid / prefix (use a 6-char prefix in practice) — or the NAME a
 session was renamed to, so `sessions open vril` works as well as `open f4a3`.
 
 Doctrine — memory promotion chain (ENVOY):
-  raw transcript   (the native log — claude .jsonl, fm-chat .jsonl, etc.)
+  raw transcript   (the native log — claude .jsonl, codex .jsonl, etc.)
     → distilled    (cheap digest, local cache)
     → promoted     (lives in the cc-vault, addressable knowledge)
 

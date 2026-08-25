@@ -71,6 +71,28 @@ def copilot(sessions):
     con.close()
 
 
+def gemini(uuid, first, extra_turns, mtime):
+    project = "acme-api"
+    project_dir = os.path.join(HOME, ".gemini", "tmp", project)
+    chats = os.path.join(project_dir, "chats")
+    os.makedirs(chats, exist_ok=True)
+    with open(os.path.join(project_dir, ".project_root"), "w", encoding="utf-8") as f:
+        f.write(os.path.realpath(DEMO_CWD))
+    short = uuid[:8]
+    lines = [{
+        "sessionId": uuid,
+        "projectHash": "demo",
+        "startTime": iso(mtime),
+        "lastUpdated": iso(mtime),
+        "kind": "main",
+    }]
+    lines.append({"type": "user", "content": [{"text": first}]})
+    for i in range(extra_turns):
+        lines.append({"type": "gemini", "content": "…"})
+        lines.append({"type": "user", "content": [{"text": "…"}]})
+    write(os.path.join(chats, f"session-2026-07-02T10-20-{short}.jsonl"), lines, mtime)
+
+
 def iso(mtime):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
 
@@ -92,6 +114,10 @@ def main():
     codex("cf19aa22-7777-8888-9999-000011112222",
           "study this folder and explain how the build system is wired", 5,
           NOW - 2 * DAY, nickname="build-scout")
+
+    gemini("66f681eb-7002-40f4-83f6-83db37b713fb",
+           "check whether the API retry handling covers rate limits", 6,
+           NOW - 90 * 60)
 
     copilot([
         ("e9ee0f44-3333-1111-5555-777799990000",

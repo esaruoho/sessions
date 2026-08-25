@@ -4,9 +4,9 @@ A single-file Python TUI session picker — and cross-provider query CLI — for
 coding-agent CLIs:
 
 - **Claude Code** (`claude`) — glyph **C**
-- **GitHub Copilot CLI** (`copilot`) — glyph **G**
+- **GitHub Copilot CLI** (`copilot`) — glyph **P**
 - **OpenAI Codex CLI** (`codex`) — glyph **X**
-- **fm-chat** (Apple on-device LLM) — glyph **F**
+- **Google Gemini CLI** (`gemini`) — glyph **G**
 
 Run it on any folder. It lists every session any provider has recorded for that folder —
 newest first, with calendar timestamp, age, turn count, on-disk size, and the first user
@@ -45,7 +45,7 @@ Keys:
 | `n` | new **Claude** session in this folder |
 | `c` | new **Copilot** session |
 | `x` | new **Codex** session |
-| `f` | new **fm-chat** session |
+| `m` | new **Gemini** session |
 | `q` / `Esc` | quit |
 
 Resume invocations:
@@ -53,7 +53,7 @@ Resume invocations:
 - Claude → `claude --dangerously-skip-permissions --resume <uuid>`
 - Copilot → `copilot --resume=<uuid>`
 - Codex → `codex resume <uuid>`
-- fm-chat → `fm-chat --resume <uuid>`
+- Gemini → `gemini --resume <uuid>`
 
 ## What each row looks like
 
@@ -107,7 +107,7 @@ sessions sgrep <phrase> [--raw] [--top N] [--threshold X]   # semantic search
 | Claude | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | `realpath(folder)`, then every non-alphanumeric char → `-`, matching Claude's own encoding (works for iCloud-symlinked projects) |
 | Copilot | `~/.copilot/session-store.db` | SQL `WHERE cwd = realpath(folder)` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | parse the `session_meta` line, match `cwd`, skip subagent rollouts |
-| fm-chat | `~/.fm-chat/sessions/<uuid>.jsonl` | `session_meta` line 1, match `cwd` |
+| Gemini | `~/.gemini/tmp/<project>/chats/session-*.jsonl` | read `.project_root`, match `realpath(folder)`, skip subagent sessions |
 
 ## Demo
 
