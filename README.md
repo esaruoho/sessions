@@ -48,6 +48,8 @@ Keys:
 | `x` | new **Codex** session |
 | `m` | new **Gemini** session |
 | `a` | new **Antigravity** session |
+| `?` (or `/`) | search: show only sessions whose full conversation contains a string (case-insensitive) |
+| `Esc` | clear the search (quits when no search is active) |
 | `q` / `Esc` | quit |
 
 Resume invocations:
