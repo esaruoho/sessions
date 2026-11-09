@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 sessions — TUI session picker for Claude Code, GitHub Copilot CLI, OpenAI Codex CLI,
-and Google Gemini CLI.
+Google Gemini CLI, and Google Antigravity CLI (agy).
 
 Upstream: https://github.com/esaruoho/sessions
 This file is the apple-repo copy; the standalone repo above is the canonical
@@ -14,7 +14,7 @@ Run inside (or pass) a project folder. Lists every session any of the four
 agents has for that folder, newest-first. Cursor up/down to select, Enter
 resumes with the right CLI + flags, n starts a new claude session, c starts
 a new copilot, x starts a new codex, m starts a new Gemini session,
-q/Esc/Ctrl-C quits. Auto-refreshes every ~1.5 s.
+a starts a new Antigravity session (agy), q/Esc/Ctrl-C quits. Auto-refreshes every ~1.5 s.
 
 Per-provider mapping:
   • Claude   ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
@@ -25,9 +25,12 @@ Per-provider mapping:
   • Codex    ~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl
              first line is session_meta with `cwd` and `id`
              resume: codex resume <uuid>
-  • Gemini   ~/.gemini/tmp/<project>/chats/session-*-<shortid>.jsonl
-             project root lives in ~/.gemini/tmp/<project>/.project_root
-             resume: gemini --resume <uuid>
+  • Gemini       ~/.gemini/tmp/<project>/chats/session-*-<shortid>.jsonl
+                 project root lives in ~/.gemini/tmp/<project>/.project_root
+                 resume: gemini --resume <uuid>
+  • Antigravity  ~/.gemini/antigravity-cli/conversation_summaries.db
+                 conversations at ~/.gemini/antigravity-cli/conversations/<uuid>.db
+                 resume: agy --dangerously-skip-permissions --conversation <uuid>
 
 Apple-native: stdlib only. No Homebrew, no pip.
 """
@@ -42,6 +45,7 @@ import sys
 import tempfile
 import time
 from shlex import quote as sh_quote
+from urllib.parse import unquote, urlparse
 
 
 HOME = os.path.expanduser("~")
@@ -432,13 +436,237 @@ def load_gemini_meta(row):
     row.snippet = (snippet or "(empty)")[:200]
 
 
+# ─────────────────────────── Antigravity ─────────────────────────────
+# Google Antigravity CLI (`agy`), stores conversations in:
+#   ~/.gemini/antigravity-cli/conversation_summaries.db (SQLite index)
+#   ~/.gemini/antigravity-cli/conversations/<uuid>.db (SQLite steps with protobuf payloads)
+
+ANTIGRAVITY_DIRS = [
+    os.path.join(HOME, ".gemini", "antigravity-cli"),
+    os.path.join(HOME, ".antigravity-cli"),
+    os.path.join(HOME, ".antigravity"),
+]
+
+
+def find_agy_bin():
+    for name in ("agy", "antigravity"):
+        b = find_bin(name)
+        if os.path.isfile(b) and os.access(b, os.X_OK):
+            return b
+    return find_bin("agy")
+
+
+def _parse_proto(b):
+    """Simple wire-format decoder for protobuf payloads. Pure stdlib."""
+    pos = 0
+    fields = []
+    l = len(b)
+    while pos < l:
+        key = 0
+        shift = 0
+        while pos < l:
+            byte = b[pos]
+            pos += 1
+            key |= (byte & 0x7f) << shift
+            if not (byte & 0x80):
+                break
+            shift += 7
+        tag = key >> 3
+        wire = key & 7
+        if wire == 0:  # varint
+            val = 0
+            shift = 0
+            while pos < l:
+                byte = b[pos]
+                pos += 1
+                val |= (byte & 0x7f) << shift
+                if not (byte & 0x80):
+                    break
+                shift += 7
+            fields.append((tag, wire, val))
+        elif wire == 2:  # length-delimited
+            length = 0
+            shift = 0
+            while pos < l:
+                byte = b[pos]
+                pos += 1
+                length |= (byte & 0x7f) << shift
+                if not (byte & 0x80):
+                    break
+                shift += 7
+            val = b[pos:pos + length]
+            pos += length
+            fields.append((tag, wire, val))
+        elif wire == 1:
+            pos += 8
+        elif wire == 5:
+            pos += 4
+        else:
+            break
+    return fields
+
+
+def _extract_antigravity_step(step_type, payload):
+    """Extract (role, text) from a step's protobuf payload."""
+    try:
+        fields = _parse_proto(payload)
+        if step_type == 14:  # User message
+            for tag, wire, val in fields:
+                if tag == 19 and wire == 2:
+                    for t2, w2, v2 in _parse_proto(val):
+                        if t2 == 2 and w2 == 2:
+                            return ("USER", v2.decode("utf-8", "replace").strip())
+        elif step_type == 15:  # Assistant response
+            for tag, wire, val in fields:
+                if tag == 20 and wire == 2:
+                    for t2, w2, v2 in _parse_proto(val):
+                        if t2 == 1 and w2 == 2:
+                            return ("ASSISTANT", v2.decode("utf-8", "replace").strip())
+    except Exception:
+        pass
+    return (None, None)
+
+
+def _parse_workspace_uris(uris_raw):
+    cwds = []
+    if not uris_raw:
+        return cwds
+    try:
+        uris = json.loads(uris_raw)
+        if isinstance(uris, list):
+            for u in uris:
+                if isinstance(u, str):
+                    if u.startswith("file://"):
+                        cwds.append(os.path.realpath(unquote(urlparse(u).path)))
+                    else:
+                        cwds.append(os.path.realpath(u))
+        elif isinstance(uris, str):
+            u = uris
+            if u.startswith("file://"):
+                cwds.append(os.path.realpath(unquote(urlparse(u).path)))
+            else:
+                cwds.append(os.path.realpath(u))
+    except Exception:
+        pass
+    return cwds
+
+
+def list_antigravity(folder):
+    resolved = os.path.realpath(folder)
+    rows = []
+    seen_ids = set()
+
+    for agy_dir in ANTIGRAVITY_DIRS:
+        if not os.path.isdir(agy_dir):
+            continue
+        db_path = os.path.join(agy_dir, "conversation_summaries.db")
+        conv_dir = os.path.join(agy_dir, "conversations")
+
+        if os.path.isfile(db_path):
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+                cur = con.cursor()
+                cols = {r[1] for r in cur.execute("PRAGMA table_info(conversation_summaries)")}
+                time_col = "last_modified_time" if "last_modified_time" in cols else (
+                    "last_user_input_time" if "last_user_input_time" in cols else "last_modified_time"
+                )
+                query = (
+                    f"SELECT conversation_id, title, preview, step_count, {time_col}, workspace_uris "
+                    f"FROM conversation_summaries ORDER BY {time_col} DESC"
+                )
+                for cid, title, preview, step_count, mtime_str, uris_raw in cur.execute(query):
+                    if cid in seen_ids:
+                        continue
+                    cwds = _parse_workspace_uris(uris_raw)
+                    if resolved not in cwds and (resolved not in (uris_raw or "")):
+                        continue
+                    seen_ids.add(cid)
+                    conv_path = os.path.join(conv_dir, f"{cid}.db") if os.path.isdir(conv_dir) else db_path
+                    mtime = parse_iso(mtime_str)
+                    size = 0
+                    if os.path.isfile(conv_path):
+                        try:
+                            st = os.stat(conv_path)
+                            size = st.st_size
+                            if not mtime:
+                                mtime = st.st_mtime
+                        except OSError:
+                            pass
+                    clean_title = (title or "").strip().replace("\n", " ")[:80] or None
+                    rows.append(Row("antigravity", cid, resolved, conv_path, mtime, size,
+                                    turns=step_count or 0, title=clean_title))
+                con.close()
+            except sqlite3.Error:
+                pass
+
+        if os.path.isdir(conv_dir):
+            try:
+                for fname in os.listdir(conv_dir):
+                    if not fname.endswith(".db"):
+                        continue
+                    cid = fname[:-3]
+                    if cid in seen_ids:
+                        continue
+                    full = os.path.join(conv_dir, fname)
+                    try:
+                        st = os.stat(full)
+                        con = sqlite3.connect(f"file:{full}?mode=ro", uri=True, timeout=0.2)
+                        cur = con.cursor()
+                        blob_match = False
+                        cur.execute("SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1")
+                        r = cur.fetchone()
+                        if r and r[0] and resolved.encode("utf-8") in r[0]:
+                            blob_match = True
+                        con.close()
+                        if not blob_match:
+                            continue
+                        seen_ids.add(cid)
+                        rows.append(Row("antigravity", cid, resolved, full, st.st_mtime, st.st_size))
+                    except Exception:
+                        continue
+            except OSError:
+                pass
+
+    rows.sort(key=lambda r: r.mtime, reverse=True)
+    return rows
+
+
+def load_antigravity_meta(row):
+    if row.snippet is not None:
+        return
+    snippet = None
+    turns = 0
+    if os.path.isfile(row.path) and row.path.endswith(".db"):
+        try:
+            con = sqlite3.connect(f"file:{row.path}?mode=ro", uri=True, timeout=0.5)
+            cur = con.cursor()
+            cur.execute("SELECT COUNT(*) FROM steps WHERE step_type = 14")
+            r = cur.fetchone()
+            if r and r[0]:
+                turns = r[0]
+            cur.execute("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx ASC LIMIT 1")
+            first = cur.fetchone()
+            if first and first[0]:
+                role, txt = _extract_antigravity_step(14, first[0])
+                if txt:
+                    snippet = txt.replace("\n", " ").strip()
+            con.close()
+        except Exception:
+            pass
+    if turns > 0:
+        row.turns = turns
+    row.snippet = (snippet or row.title or "(empty)")[:200]
+
+
 # ─────────────────────────── shared helpers ──────────────────────────
 
 LOAD = {
-    "claude":   load_claude_meta,
-    "copilot":  load_copilot_meta,
-    "codex":    load_codex_meta,
-    "gemini":   load_gemini_meta,
+    "claude":      load_claude_meta,
+    "copilot":     load_copilot_meta,
+    "codex":       load_codex_meta,
+    "gemini":      load_gemini_meta,
+    "antigravity": load_antigravity_meta,
+    "agy":         load_antigravity_meta,
 }
 
 
@@ -448,6 +676,7 @@ def list_all(folder):
     rows.extend(list_copilot(folder))
     rows.extend(list_codex(folder))
     rows.extend(list_gemini(folder))
+    rows.extend(list_antigravity(folder))
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
 
@@ -504,7 +733,14 @@ def human_size(n):
     return f"{n/1024/1024:.1f}M"
 
 
-PROVIDER_GLYPH = {"claude": "C", "copilot": "P", "codex": "X", "gemini": "G"}
+PROVIDER_GLYPH = {
+    "claude":      "C",
+    "copilot":     "P",
+    "codex":       "X",
+    "gemini":      "G",
+    "antigravity": "A",
+    "agy":         "A",
+}
 
 
 def find_bin(name, extra_paths=()):
@@ -529,6 +765,8 @@ def resume_argv(provider, uuid, path=None):
         return [find_bin("codex"), "resume", uuid]
     if provider == "gemini":
         return [find_bin("gemini"), "--resume", uuid]
+    if provider in ("antigravity", "agy"):
+        return [find_agy_bin(), "--dangerously-skip-permissions", "--conversation", uuid]
     raise ValueError(provider)
 
 
@@ -541,6 +779,8 @@ def new_argv(provider):
         return [find_bin("codex")]
     if provider == "gemini":
         return [find_bin("gemini")]
+    if provider in ("antigravity", "agy"):
+        return [find_agy_bin(), "--dangerously-skip-permissions"]
     raise ValueError(provider)
 
 
@@ -597,13 +837,14 @@ def run_picker(stdscr, folder):
         pn = sum(1 for r in rows if r.provider == "copilot")
         xn = sum(1 for r in rows if r.provider == "codex")
         gn = sum(1 for r in rows if r.provider == "gemini")
+        an = sum(1 for r in rows if r.provider in ("antigravity", "agy"))
         # Never draw into the last column: writing the final cell puts
         # auto-wrap terminals (iTerm2) into a "pending wrap" state that smears
         # the next line — the stacked duplicate rows and right-edge black boxes.
         W = max(1, w - 1)
         disp = folder.replace(HOME, "~", 1) if folder.startswith(HOME) else folder
-        header = display_safe(f" sessions · {disp}   C:{cn} P:{pn} X:{xn} G:{gn}")
-        footer = " ↑/↓ select · ⏎ resume · n claude · c copilot · x codex · m gemini · q quit · auto-refresh"
+        header = display_safe(f" sessions · {disp}   C:{cn} P:{pn} X:{xn} G:{gn} A:{an}")
+        footer = " ↑/↓ select · ⏎ resume · n claude · c copilot · x codex · m gemini · a agy · q quit · auto-refresh"
         try:
             stdscr.addnstr(0, 0, header.ljust(W), W, curses.color_pair(2) | curses.A_BOLD)
             stdscr.addnstr(h - 1, 0, footer.ljust(W), W, curses.color_pair(3))
@@ -611,7 +852,7 @@ def run_picker(stdscr, folder):
             pass
 
         if not rows:
-            msg = "No sessions for this folder. n=claude  c=copilot  x=codex  m=gemini  q=quit"
+            msg = "No sessions for this folder. n=claude  c=copilot  x=codex  m=gemini  a=agy  q=quit"
             try:
                 stdscr.addnstr(h // 2, max(0, (w - len(msg)) // 2), msg, W)
             except curses.error:
@@ -713,6 +954,8 @@ def run_picker(stdscr, folder):
             return ("new", "codex", None, None)
         elif k in (ord('m'), ord('M')):
             return ("new", "gemini", None, None)
+        elif k in (ord('a'), ord('A')):
+            return ("new", "antigravity", None, None)
         elif k in (ord('q'), ord('Q'), 27):
             return ("quit", None, None, None)
 
@@ -812,6 +1055,65 @@ def all_rows_global():
                                     st.st_size))
         except OSError:
             pass
+    # Antigravity (agy)
+    seen_agy = set()
+    for agy_dir in ANTIGRAVITY_DIRS:
+        if not os.path.isdir(agy_dir):
+            continue
+        db_path = os.path.join(agy_dir, "conversation_summaries.db")
+        conv_dir = os.path.join(agy_dir, "conversations")
+        if os.path.isfile(db_path):
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+                cur = con.cursor()
+                cols = {r[1] for r in cur.execute("PRAGMA table_info(conversation_summaries)")}
+                time_col = "last_modified_time" if "last_modified_time" in cols else (
+                    "last_user_input_time" if "last_user_input_time" in cols else "last_modified_time"
+                )
+                query = (
+                    f"SELECT conversation_id, title, preview, step_count, {time_col}, workspace_uris "
+                    f"FROM conversation_summaries"
+                )
+                for cid, title, preview, step_count, mtime_str, uris_raw in cur.execute(query):
+                    if cid in seen_agy:
+                        continue
+                    seen_agy.add(cid)
+                    cwds = _parse_workspace_uris(uris_raw)
+                    cwd = cwds[0] if cwds else "(unknown)"
+                    conv_path = os.path.join(conv_dir, f"{cid}.db") if os.path.isdir(conv_dir) else db_path
+                    mtime = parse_iso(mtime_str)
+                    size = 0
+                    if os.path.isfile(conv_path):
+                        try:
+                            st = os.stat(conv_path)
+                            size = st.st_size
+                            if not mtime:
+                                mtime = st.st_mtime
+                        except OSError:
+                            pass
+                    clean_title = (title or "").strip().replace("\n", " ")[:80] or None
+                    rows.append(Row("antigravity", cid, cwd, conv_path, mtime, size,
+                                    turns=step_count or 0, title=clean_title))
+                con.close()
+            except sqlite3.Error:
+                pass
+        if os.path.isdir(conv_dir):
+            try:
+                for fname in os.listdir(conv_dir):
+                    if not fname.endswith(".db"):
+                        continue
+                    cid = fname[:-3]
+                    if cid in seen_agy:
+                        continue
+                    seen_agy.add(cid)
+                    full = os.path.join(conv_dir, fname)
+                    try:
+                        st = os.stat(full)
+                        rows.append(Row("antigravity", cid, "(unknown)", full, st.st_mtime, st.st_size))
+                    except Exception:
+                        continue
+            except OSError:
+                pass
     rows.sort(key=lambda r: r.mtime, reverse=True)
     return rows
 
@@ -939,6 +1241,20 @@ def render_session(row):
                             continue
                         heading = "ASSISTANT" if role == "gemini" else "USER"
                         out.append(f"\n## {heading}\n{c}")
+        elif row.provider in ("antigravity", "agy"):
+            if os.path.isfile(row.path) and row.path.endswith(".db"):
+                try:
+                    con = sqlite3.connect(f"file:{row.path}?mode=ro", uri=True)
+                    cur = con.cursor()
+                    for idx, step_type, payload in cur.execute(
+                        "SELECT idx, step_type, step_payload FROM steps WHERE step_type IN (14, 15) ORDER BY idx"
+                    ):
+                        role, txt = _extract_antigravity_step(step_type, payload)
+                        if txt and txt.strip():
+                            out.append(f"\n## {role}\n{txt.strip()}")
+                    con.close()
+                except Exception:
+                    pass
     except FileNotFoundError:
         out.append(f"(file not found: {row.path})")
     return "\n".join(out)
@@ -1736,7 +2052,7 @@ Usage:
               [--raw] [--top N]       (Apple NaturalLanguage embeddings, on-device).
               [--threshold X]         --raw searches full transcripts (newest 30).
 
-Providers:  claude (C) · copilot (P) · codex (X) · gemini (G)
+Providers:  claude (C) · copilot (P) · codex (X) · gemini (G) · antigravity (A)
 IDs match any uuid / prefix (use a 6-char prefix in practice) — or the NAME a
 session was renamed to, so `sessions open vril` works as well as `open f4a3`.
 

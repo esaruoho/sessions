@@ -7,6 +7,7 @@ coding-agent CLIs:
 - **GitHub Copilot CLI** (`copilot`) — glyph **P**
 - **OpenAI Codex CLI** (`codex`) — glyph **X**
 - **Google Gemini CLI** (`gemini`) — glyph **G**
+- **Google Antigravity CLI** (`agy`) — glyph **A**
 
 Run it on any folder. It lists every session any provider has recorded for that folder —
 newest first, with calendar timestamp, age, turn count, on-disk size, and the first user
@@ -46,6 +47,7 @@ Keys:
 | `c` | new **Copilot** session |
 | `x` | new **Codex** session |
 | `m` | new **Gemini** session |
+| `a` | new **Antigravity** session |
 | `q` / `Esc` | quit |
 
 Resume invocations:
@@ -54,6 +56,7 @@ Resume invocations:
 - Copilot → `copilot --resume=<uuid>`
 - Codex → `codex resume <uuid>`
 - Gemini → `gemini --resume <uuid>`
+- Antigravity → `agy --dangerously-skip-permissions --conversation <uuid>`
 
 ## What each row looks like
 
@@ -108,6 +111,7 @@ sessions sgrep <phrase> [--raw] [--top N] [--threshold X]   # semantic search
 | Copilot | `~/.copilot/session-store.db` | SQL `WHERE cwd = realpath(folder)` |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | parse the `session_meta` line, match `cwd`, skip subagent rollouts |
 | Gemini | `~/.gemini/tmp/<project>/chats/session-*.jsonl` | read `.project_root`, match `realpath(folder)`, skip subagent sessions |
+| Antigravity | `~/.gemini/antigravity-cli/conversation_summaries.db` | query `workspace_uris` for `realpath(folder)` |
 
 ## Demo
 

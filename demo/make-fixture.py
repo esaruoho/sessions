@@ -93,6 +93,63 @@ def gemini(uuid, first, extra_turns, mtime):
     write(os.path.join(chats, f"session-2026-07-02T10-20-{short}.jsonl"), lines, mtime)
 
 
+def antigravity(uuid, title, first, extra_turns, mtime):
+    agy_dir = os.path.join(HOME, ".gemini", "antigravity-cli")
+    conv_dir = os.path.join(agy_dir, "conversations")
+    os.makedirs(conv_dir, exist_ok=True)
+    sum_db = os.path.join(agy_dir, "conversation_summaries.db")
+    con = sqlite3.connect(sum_db)
+    con.execute("""CREATE TABLE IF NOT EXISTS conversation_summaries (
+        conversation_id text PRIMARY KEY,
+        title text NOT NULL DEFAULT '',
+        preview text NOT NULL DEFAULT '',
+        step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL,
+        workspace_uris text NOT NULL
+    )""")
+    con.execute(
+        """INSERT OR REPLACE INTO conversation_summaries
+        (conversation_id, title, preview, step_count, last_modified_time, workspace_uris)
+        VALUES (?, ?, ?, ?, ?, ?)""",
+        (uuid, title, first, extra_turns + 1, iso(mtime), json.dumps([f"file://{os.path.realpath(DEMO_CWD)}"]))
+    )
+    con.commit()
+    con.close()
+
+    conv_db = os.path.join(conv_dir, f"{uuid}.db")
+    c2 = sqlite3.connect(conv_db)
+    c2.execute("""CREATE TABLE IF NOT EXISTS steps (
+        idx integer PRIMARY KEY,
+        step_type integer NOT NULL DEFAULT 0,
+        step_payload blob
+    )""")
+
+    def enc_varint(v):
+        out = bytearray()
+        while v > 0x7f:
+            out.append((v & 0x7f) | 0x80)
+            v >>= 7
+        out.append(v & 0x7f)
+        return bytes(out)
+
+    def enc_tag(tag, wire):
+        return enc_varint((tag << 3) | wire)
+
+    def enc_len_delim(tag, data):
+        return enc_tag(tag, 2) + enc_varint(len(data)) + data
+
+    user_bytes = first.encode("utf-8")
+    tag19 = enc_len_delim(2, user_bytes)
+    payload = enc_len_delim(19, tag19)
+    c2.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", (0, 14, payload))
+    for i in range(1, extra_turns + 1):
+        c2.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", (i, 15, b""))
+    c2.commit()
+    c2.close()
+    os.utime(conv_db, (mtime, mtime))
+    os.utime(sum_db, (mtime, mtime))
+
+
 def iso(mtime):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
 
@@ -118,6 +175,11 @@ def main():
     gemini("66f681eb-7002-40f4-83f6-83db37b713fb",
            "check whether the API retry handling covers rate limits", 6,
            NOW - 90 * 60)
+
+    antigravity("fe14ca56-5978-4540-90ae-8c529d83727a",
+                "autonomous test runner",
+                "spin up autonomous test runner and verify coverage", 14,
+                NOW - 25 * 60)
 
     copilot([
         ("e9ee0f44-3333-1111-5555-777799990000",
